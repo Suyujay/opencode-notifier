@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- OpenCode 2 plugin API support (#102)
+  - The default export now exposes an `id` and `setup(ctx)` definition alongside the existing `server()` entrypoint.
+  - Subscribes to the V2 event stream, maps V2 events (`session.execution.failed`, `session.execution.interrupted`, `session.inbox.enqueued`, ...) to the existing notification events, and registers the equivalent tool hook.
+  - The auto-approved permission check also runs on V2, through `ctx.permission.list`.
+  - No configuration changes: the same package loads on OpenCode 1 (1.18.29 or later) and OpenCode 2.
+
 ## [0.3.0-beta.0] - 2026-09-21
 
 ### Added
