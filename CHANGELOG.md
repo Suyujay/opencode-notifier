@@ -4,14 +4,31 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-### Fixed
-- Linux GNOME Wayland: `suppressWhenFocused` now works via AT-SPI focus detection (#83, #104)
+## [0.3.0-beta.0] - 2026-09-21
+
+### Added
+- Linux GNOME Wayland: `suppressWhenFocused` now works via AT-SPI focus detection (#105, follow-up #111; issues #83, #104)
   - GNOME exposes no compositor focus API and `xdotool` cannot see native Wayland windows, so the backend reads the AT-SPI `ACTIVE` state bit over `org.a11y.Bus` (requires `gdbus`)
   - Ghostty is matched by its `/com/mitchellh/ghostty` AT-SPI path, other terminals by app name (including the `gnome-terminal-server` AT-SPI alias)
   - Window identity is `bus@path` since AT-SPI object paths repeat across D-Bus bus names
+  - Unknown window roles are excluded so a failed lookup fails open instead of suppressing a notification
   - Implemented and verified on Ubuntu 26.04.1 LTS + GNOME Shell 50.1 + Ghostty 1.3.0
   - Previously GNOME sessions always fell back to notifying (and with `notificationSystem: ghostty`, Ghostty hid its own banner while plugin sounds still played)
-- Added `OPENCODE_NOTIFIER_DEBUG=1` to log the focus backend decision (`cached`/`current` window, session, result)
+- Permission notifications are skipped when the request was auto-approved (#98, follow-up #112; issue #94)
+  - On `permission.asked` the plugin waits 300ms and only notifies if the request is still pending; any lookup failure notifies (fail-open)
+  - The shared dedupe window is claimed only when a notification actually fires, so a skipped auto-approved request no longer mutes a real one
+- Added `OPENCODE_NOTIFIER_DEBUG=1` to log the focus backend decision (backend, `cached`/`current` window, session, result)
+- README: install shortcut via `opencode plug -g @mohak34/opencode-notifier` (#99)
+
+### Fixed
+- Windows: PowerShell sound playback uses `-EncodedCommand` so args never contain spaces (#101)
+- Security hardening: no child process is spawned through a shell anymore (#100)
+  - All `execFileSync` calls use argv arrays with `shell: false`
+  - Window IDs are validated before use; KWin socket uses `mkdtemp`; Ghostty fields are sanitized
+- KDE: `qdbus` is resolved via `PATH` scan (including Fedora's versioned names) without invoking a shell (#103, #109)
+
+### Changed
+- Releases publish from CI via npm OIDC trusted publishing; beta tags (`v*-beta*`) go to the `beta` dist-tag, plain version tags go to `latest`
 
 ## [0.2.8] - 2026-06-05
 

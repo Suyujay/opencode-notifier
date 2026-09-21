@@ -1,17 +1,18 @@
-name: release-beta
+name: release
 
-# Publishes to npm with the `beta` dist-tag. Runs ONLY on beta tags, never on
-# branch pushes or PRs. Release with:
-#   npm version 0.2.9-beta.1
-#   git push && git push --tags
-# Auth is OIDC trusted publishing: no tokens or secrets. One-time setup on
-# npmjs.com (package Settings -> Trusted Publisher -> GitHub Actions, repo
-# mohak34/opencode-notifier, workflow release-beta.yml, allow `npm publish`).
+# Publishes to npm via OIDC trusted publishing (no tokens or secrets). Runs
+# ONLY on version tags, never on branch pushes or PRs. The dist-tag is routed
+# by tag shape, so beta and stable can never cross:
+#   v0.3.0-beta.0 -> `beta`    (npm version 0.3.0-beta.0 && git push --tags)
+#   v0.3.0        -> `latest`  (npm version 0.3.0 && git push --tags)
+# One-time setup on npmjs.com (package Settings -> Trusted Publisher ->
+# GitHub Actions, repo mohak34/opencode-notifier, workflow release-beta.yml,
+# allow `npm publish`). The filename is historic; it now handles both tracks.
 
 on:
   push:
     tags:
-      - "v*-beta*"
+      - "v*"
 
 permissions:
   id-token: write # required for npm OIDC trusted publishing
@@ -40,4 +41,13 @@ jobs:
           registry-url: "https://registry.npmjs.org"
 
       - run: npm install -g npm@latest
-      - run: npm publish --tag beta --provenance
+
+      - name: Publish to npm (beta or stable by tag shape)
+        run: |
+          if [[ "${GITHUB_REF_NAME}" == *-beta* ]]; then
+            TAG=beta
+          else
+            TAG=latest
+          fi
+          echo "Publishing ${GITHUB_REF_NAME} with dist-tag ${TAG}"
+          npm publish --tag "${TAG}" --provenance
