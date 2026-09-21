@@ -27,9 +27,6 @@ All notable changes to this project will be documented in this file.
   - Window IDs are validated before use; KWin socket uses `mkdtemp`; Ghostty fields are sanitized
 - KDE: `qdbus` is resolved via `PATH` scan (including Fedora's versioned names) without invoking a shell (#103, #109)
 
-### Changed
-- Releases publish from CI via npm OIDC trusted publishing; beta tags (`v*-beta*`) go to the `beta` dist-tag, plain version tags go to `latest`
-
 ## [0.2.8] - 2026-06-05
 
 ### Fixed
