@@ -11,6 +11,29 @@ const FULL_VOLUME_PERCENT = 100
 const FULL_VOLUME_PULSE = 65536
 
 const lastSoundTime: Record<string, number> = {}
+let lastAnySoundTime = 0
+
+// One sound per second max, across all events. The per-event check alone
+// lets stacked distinct events (permission + complete) play back-to-back
+// pings for a single moment needing attention (#52).
+export function claimSoundSlot(event: EventType, now: number = Date.now()): boolean {
+  if (now - lastAnySoundTime < DEBOUNCE_MS) {
+    return false
+  }
+  if (lastSoundTime[event] && now - lastSoundTime[event] < DEBOUNCE_MS) {
+    return false
+  }
+  lastAnySoundTime = now
+  lastSoundTime[event] = now
+  return true
+}
+
+export function resetSoundState(): void {
+  for (const key of Object.keys(lastSoundTime)) {
+    delete lastSoundTime[key]
+  }
+  lastAnySoundTime = 0
+}
 
 function getBundledSoundPath(event: EventType): string {
   const soundFilename = `${event}.wav`
@@ -134,11 +157,9 @@ export async function playSound(
   customPath: string | null,
   volume: number
 ): Promise<void> {
-  const now = Date.now()
-  if (lastSoundTime[event] && now - lastSoundTime[event] < DEBOUNCE_MS) {
+  if (!claimSoundSlot(event)) {
     return
   }
-  lastSoundTime[event] = now
 
   const soundPath = getSoundFilePath(event, customPath)
   const normalizedVolume = normalizeVolume(volume)
