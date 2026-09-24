@@ -546,7 +546,7 @@ export const NotifierPlugin: Plugin = async ({ client, directory }) => {
   return {
     event: async ({ event }) => {
       // A notifier must never take down the host: an unexpected event shape
-      // fails silent instead of crashing OpenCode (#25).
+      // fails silently instead of crashing OpenCode (#25).
       try {
         const config = getConfig()
 
@@ -638,22 +638,30 @@ export const NotifierPlugin: Plugin = async ({ client, directory }) => {
           }
         }
       } catch {
-        // Fail silent: notification side effects must not break the session.
+        // Fail silently: notification side effects must not break the session.
       }
     },
     "permission.ask": async () => {
-      const config = getConfig()
-      if (!shouldSuppressPermissionAlert(null)) {
-        await handleEvent(config, "permission", projectName, null)
+      try {
+        const config = getConfig()
+        if (!shouldSuppressPermissionAlert(null)) {
+          await handleEvent(config, "permission", projectName, null)
+        }
+      } catch {
+        // Fail silently: notification side effects must not break the session.
       }
     },
     "tool.execute.before": async (input) => {
-      const config = getConfig()
-      if (input.tool === "question") {
-        await handleEvent(config, "question", projectName, null)
-      }
-      if (input.tool === "plan_exit") {
-        await handleEvent(config, "plan_exit", projectName, null)
+      try {
+        const config = getConfig()
+        if (input.tool === "question") {
+          await handleEvent(config, "question", projectName, null)
+        }
+        if (input.tool === "plan_exit") {
+          await handleEvent(config, "plan_exit", projectName, null)
+        }
+      } catch {
+        // Fail silently: notification side effects must not break the session.
       }
     },
   }

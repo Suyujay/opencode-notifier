@@ -45,19 +45,30 @@ describe("plugin never throws (issue #25)", () => {
     const { NotifierPlugin } = await import("./index")
     const plugin = await NotifierPlugin({ client: mockClient, directory: "/tmp/proj" } as never)
     if (!plugin.event) throw new Error("plugin has no event hook")
-    return plugin.event as (input: { event: never }) => Promise<void>
+    return plugin as {
+      event: (input: { event: never }) => Promise<void>
+      "permission.ask": () => Promise<void>
+      "tool.execute.before": (input: never) => Promise<void>
+    }
   }
 
   test("malformed session.status without properties does not throw", async () => {
-    const onEvent = await initPlugin()
+    const { event: onEvent } = await initPlugin()
     await onEvent({ event: { type: "session.status" } as never })
     await onEvent({ event: { type: "session.status", properties: {} } as never })
   })
 
   test("malformed session.error without properties does not throw", async () => {
-    const onEvent = await initPlugin()
+    const { event: onEvent } = await initPlugin()
     await onEvent({ event: { type: "session.error" } as never })
     await onEvent({ event: { type: "session.error", properties: {} } as never })
+  })
+
+  test("adjacent hooks with malformed input do not throw", async () => {
+    const plugin = await initPlugin()
+    await plugin["permission.ask"]()
+    await plugin["tool.execute.before"](undefined as never)
+    await plugin["tool.execute.before"]({} as never)
   })
 
   test("runCommand with a missing binary does not throw", async () => {
