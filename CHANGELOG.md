@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-09-24 (@nm156/opencode-notifier fork)
+
 ### Added
 - OpenCode 2 plugin API support (#102)
   - The default export now exposes an `id` and `setup(ctx)` definition alongside the existing `server()` entrypoint.

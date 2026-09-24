@@ -1,16 +1,21 @@
 # opencode-notifier
 
+> [!NOTE]
+> This is a fork of [`@mohak34/opencode-notifier`](https://github.com/mohak34/opencode-notifier) that adds
+> OpenCode 2 support from [mohak34/opencode-notifier#110](https://github.com/mohak34/opencode-notifier/pull/110),
+> rebased onto 0.3.0. Use the upstream package once it supports OpenCode 2.
+
 OpenCode plugin that plays sounds and sends system notifications when permission is needed, generation completes, errors occur, or the question tool is invoked. Works on macOS, Linux, and Windows.
 
 ## Quick Start
 
-Install the plugin via the CLI: `opencode plug -g @mohak34/opencode-notifier`.
+Install the plugin via the CLI: `opencode plug -g @nm156/opencode-notifier`.
 
 Or add manually to your `opencode.json`:
 
   ```json
   {
-    "plugin": ["@mohak34/opencode-notifier@latest"]
+    "plugin": ["@nm156/opencode-notifier@latest"]
   }
   ```
 
@@ -497,16 +502,16 @@ OpenCode caches plugin packages under `~/.cache/opencode`. If you switch between
 Linux/macOS:
 
 ```bash
-rm -rf ~/.cache/opencode/packages/@mohak34/opencode-notifier*
-rm -rf ~/.cache/opencode/node_modules/@mohak34/opencode-notifier
+rm -rf ~/.cache/opencode/packages/@nm156/opencode-notifier*
+rm -rf ~/.cache/opencode/node_modules/@nm156/opencode-notifier
 rm -f ~/.cache/opencode/bun.lock
 ```
 
 Windows PowerShell:
 
 ```powershell
-Remove-Item -Recurse -Force "$env:USERPROFILE\.cache\opencode\packages\@mohak34\opencode-notifier*" -ErrorAction SilentlyContinue
-Remove-Item -Recurse -Force "$env:USERPROFILE\.cache\opencode\node_modules\@mohak34\opencode-notifier" -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force "$env:USERPROFILE\.cache\opencode\packages\@nm156\opencode-notifier*" -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force "$env:USERPROFILE\.cache\opencode\node_modules\@nm156\opencode-notifier" -ErrorAction SilentlyContinue
 Remove-Item -Force "$env:USERPROFILE\.cache\opencode\bun.lock" -ErrorAction SilentlyContinue
 ```
 
@@ -516,21 +521,21 @@ To avoid cache confusion while testing, pin the exact version in `opencode.json`
 
 ```json
 {
-  "plugin": ["@mohak34/opencode-notifier@x.y.z"]
+  "plugin": ["@nm156/opencode-notifier@x.y.z"]
 }
 ```
 
 Check the version published under a tag:
 
 ```bash
-npm view @mohak34/opencode-notifier@latest version
-npm view @mohak34/opencode-notifier@beta version
+npm view @nm156/opencode-notifier@latest version
+npm view @nm156/opencode-notifier@beta version
 ```
 
 Check the version OpenCode cached:
 
 ```bash
-cat ~/.cache/opencode/packages/@mohak34/opencode-notifier@latest/node_modules/@mohak34/opencode-notifier/package.json | grep version
+cat ~/.cache/opencode/packages/@nm156/opencode-notifier@latest/node_modules/@nm156/opencode-notifier/package.json | grep version
 ```
 
 If you use `@beta` or a pinned version, replace `latest` in the path with `beta` or the exact version, for example `0.2.9-beta.0`.
@@ -661,7 +666,7 @@ This is a known Bun issue on Windows. Disable native notifications and use Power
 - Check `enableOnDesktop`: defaults to `false`, so the plugin won't run on Desktop/Web clients. Set to `true` if you need it there.
 - Verify the package version OpenCode cached:
   ```bash
-  cat ~/.cache/opencode/packages/@mohak34/opencode-notifier@latest/node_modules/@mohak34/opencode-notifier/package.json | grep version
+  cat ~/.cache/opencode/packages/@nm156/opencode-notifier@latest/node_modules/@nm156/opencode-notifier/package.json | grep version
   ```
   If you use `@beta` or a pinned version, replace `latest` in the path with `beta` or the exact version.
 
