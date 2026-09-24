@@ -103,7 +103,8 @@ describe("deleted child sessions (issue #108)", () => {
       event: sessionEvent("session.idle", { sessionID: "gone" }),
     })
 
-    expect(stdoutWrites.filter((w) => w.includes("OpenCode"))).toEqual([])
+    expect(finishedNotifications()).toEqual([])
+    expect(sessionGetCalls).toEqual(["gone"])
   })
 
   test("top-level idle still fires complete", async () => {
