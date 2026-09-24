@@ -157,16 +157,18 @@ export async function playSound(
   customPath: string | null,
   volume: number
 ): Promise<void> {
+  // Resolve before claiming: an event with no sound file (no custom path
+  // and no bundled wav) must not consume the shared slot (#119 review).
+  const soundPath = getSoundFilePath(event, customPath)
+  if (!soundPath) {
+    return
+  }
+
   if (!claimSoundSlot(event)) {
     return
   }
 
-  const soundPath = getSoundFilePath(event, customPath)
   const normalizedVolume = normalizeVolume(volume)
-
-  if (!soundPath) {
-    return
-  }
 
   const os = platform()
 
