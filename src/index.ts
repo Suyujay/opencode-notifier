@@ -768,16 +768,19 @@ export function normalizeV2Event(event: unknown): NotifierEvent[] {
     })
   }
 
-  if (type === "session.idle") {
-    events.push({ type: "session.idle", sessionID: getStringField(data, "sessionID") })
-  }
-
-  if (type === "session.status") {
-    const status = getNestedRecord(event, "data", "status")
+  // V2 reports the agent loop lifecycle through the durable session.execution.*
+  // events. The legacy session.idle and session.status events are not emitted
+  // by the V2 CLI, so they are intentionally not mapped to avoid double alerts
+  // from clients that emit both.
+  if (type === "session.execution.started") {
     const sessionID = getStringField(data, "sessionID")
-    if (getStringField(status, "type") === "busy" && sessionID) {
+    if (sessionID) {
       events.push({ type: "session.busy", sessionID })
     }
+  }
+
+  if (type === "session.execution.succeeded") {
+    events.push({ type: "session.idle", sessionID: getStringField(data, "sessionID") })
   }
 
   if (type === "session.execution.failed") {
@@ -785,11 +788,15 @@ export function normalizeV2Event(event: unknown): NotifierEvent[] {
   }
 
   if (type === "session.execution.interrupted") {
-    events.push({
-      type: "session.error",
-      sessionID: getStringField(data, "sessionID"),
-      userCancelled: getStringField(data, "reason") === "user",
-    })
+    // "superseded" (a newer prompt took over) and "shutdown" are not failures.
+    const reason = getStringField(data, "reason")
+    if (reason === "user" || reason === "inactivity") {
+      events.push({
+        type: "session.error",
+        sessionID: getStringField(data, "sessionID"),
+        userCancelled: reason === "user",
+      })
+    }
   }
 
   if (type === "session.inbox.enqueued") {
@@ -894,6 +901,15 @@ export const NotifierPlugin: Plugin = async ({ client, directory }) => {
   }
 }
 
+export function isV2Context(ctx: unknown): boolean {
+  const record = asRecord(ctx)
+  return (
+    typeof asRecord(record?.event)?.subscribe === "function" &&
+    typeof asRecord(record?.tool)?.hook === "function" &&
+    typeof asRecord(record?.session)?.get === "function"
+  )
+}
+
 /**
  * V2 (OpenCode 2.x) entrypoint. V1 plugin implementations do not run in V2, so
  * this registers the same behavior through the V2 setup/context API.
@@ -901,6 +917,11 @@ export const NotifierPlugin: Plugin = async ({ client, directory }) => {
 export const NotifierPluginV2: OpenCodePlugin = {
   id: "opencode-notifier",
   async setup(ctx) {
+    // OpenCode 1.18.x calls both `server()` and `setup()` on a combined export,
+    // passing `setup()` a partial context without the V2 domains. The V1
+    // entrypoint already handles that host, so skip here to avoid a second runtime.
+    if (!isV2Context(ctx)) return
+
     const runtime = createNotifierRuntime(
       createV2SessionClient(ctx),
       ctx.location?.directory ?? null,

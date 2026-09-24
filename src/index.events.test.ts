@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test"
-import { normalizeV1Event, normalizeV2Event } from "./index"
+import { isV2Context, normalizeV1Event, normalizeV2Event } from "./index"
 
 describe("normalizeV1Event", () => {
   test("maps session.created with a parentID to subagent tracking", () => {
@@ -143,19 +143,23 @@ describe("normalizeV2Event", () => {
     ])
   })
 
-  test("maps session.idle from the data envelope", () => {
-    expect(normalizeV2Event({ type: "session.idle", data: { sessionID: "s-1" } })).toEqual([
+  test("maps session.execution.succeeded to session.idle", () => {
+    expect(normalizeV2Event({ type: "session.execution.succeeded", data: { sessionID: "s-1" } })).toEqual([
       { type: "session.idle", sessionID: "s-1" },
     ])
   })
 
-  test("maps a busy session.status", () => {
-    const events = normalizeV2Event({
-      type: "session.status",
-      data: { sessionID: "s-1", status: { type: "busy" } },
-    })
+  test("maps session.execution.started to session.busy", () => {
+    expect(normalizeV2Event({ type: "session.execution.started", data: { sessionID: "s-1" } })).toEqual([
+      { type: "session.busy", sessionID: "s-1" },
+    ])
+  })
 
-    expect(events).toEqual([{ type: "session.busy", sessionID: "s-1" }])
+  test("ignores the non-durable session.idle and session.status events", () => {
+    expect(normalizeV2Event({ type: "session.idle", data: { sessionID: "s-1" } })).toEqual([])
+    expect(
+      normalizeV2Event({ type: "session.status", data: { sessionID: "s-1", status: { type: "busy" } } })
+    ).toEqual([])
   })
 
   test("maps session.execution.failed to error", () => {
@@ -176,13 +180,21 @@ describe("normalizeV2Event", () => {
     expect(events[0]).toMatchObject({ type: "session.error", sessionID: "s-1", userCancelled: true })
   })
 
-  test("maps a non-user interruption to error", () => {
+  test("maps an inactivity interruption to error", () => {
     const events = normalizeV2Event({
       type: "session.execution.interrupted",
-      data: { sessionID: "s-1", reason: "shutdown" },
+      data: { sessionID: "s-1", reason: "inactivity" },
     })
 
     expect(events[0]).toMatchObject({ type: "session.error", sessionID: "s-1", userCancelled: false })
+  })
+
+  test("ignores superseded and shutdown interruptions", () => {
+    for (const reason of ["superseded", "shutdown"]) {
+      expect(normalizeV2Event({ type: "session.execution.interrupted", data: { sessionID: "s-1", reason } })).toEqual(
+        []
+      )
+    }
   })
 
   test("maps an enqueued user inbox item to message.user", () => {
@@ -205,5 +217,17 @@ describe("normalizeV2Event", () => {
 
   test("ignores unrelated events", () => {
     expect(normalizeV2Event({ type: "server.connected", data: {} })).toEqual([])
+  })
+})
+
+describe("isV2Context", () => {
+  test("accepts a context exposing the V2 event, tool, and session domains", () => {
+    const fn = () => undefined
+    expect(isV2Context({ event: { subscribe: fn }, tool: { hook: fn }, session: { get: fn } })).toBe(true)
+  })
+
+  test("rejects the partial context OpenCode 1.18 passes to setup()", () => {
+    expect(isV2Context({ options: {}, agent: {}, command: {}, plugin: {}, skill: {} })).toBe(false)
+    expect(isV2Context(undefined)).toBe(false)
   })
 })

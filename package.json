@@ -39,7 +39,7 @@
   },
   "devDependencies": {
     "@opencode-ai/plugin": "^1.18.25",
-    "@opencode/plugin": "2.0.6",
+    "@opencode/plugin": "^2.0.16",
     "@types/node": "^22.0.0",
     "@types/node-notifier": "^8.0.5",
     "typescript": "^5.0.0"
