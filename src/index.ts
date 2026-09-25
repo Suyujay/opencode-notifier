@@ -69,15 +69,12 @@ function claimFired(key: string, windowMs: number = DEDUPE_WINDOW_MS): boolean {
   return true
 }
 
-// session.execution.* events carry the session id in properties (same shape as
-// the other session events); fall back to info.id / top-level just in case.
+// session.execution.* events carry the session id flat in data; keep the
+// legacy nested lookups as fallback.
 function getExecutionSessionID(event: unknown): string | null {
-  const fromProps = getSessionIDFromEvent(event)
-  if (fromProps) return fromProps
-  const info = getNestedRecord(event, "properties", "info")
-  const fromInfo = getStringField(info, "id")
-  if (fromInfo) return fromInfo
-  return getStringField(asRecord(event), "sessionID")
+  const direct = getSessionIDFromEvent(event)
+  if (direct) return direct
+  return getStringField(getNestedRecord(eventData(event), "info"), "id")
 }
 
 // Minimal session API surface the notifier needs. V1 wraps the legacy SDK
@@ -202,6 +199,13 @@ function getStringField(record: UnknownRecord | null, key: string): string | nul
   }
   const value = record[key]
   return typeof value === "string" && value.length > 0 ? value : null
+}
+
+// v2 delivers event payloads flat under `data`; v1 used `properties`
+// (sometimes nested under `info`). Prefer v2, fall back to v1 shapes so both
+// runtimes and unit tests keep working.
+function eventData(event: unknown): UnknownRecord {
+  return getNestedRecord(event, "data") ?? getNestedRecord(event, "properties") ?? asRecord(event) ?? {}
 }
 
 let globalTurnCount: number | null = null
@@ -382,17 +386,16 @@ async function handleEvent(
 }
 
 function getSessionIDFromEvent(event: unknown): string | null {
-  const properties = getNestedRecord(event, "properties")
-  return getStringField(properties, "sessionID")
+  return getStringField(eventData(event), "sessionID")
 }
 
 export function getPermissionIDFromEvent(event: unknown): string | null {
-  const properties = getNestedRecord(event, "properties")
-  const id = getStringField(properties, "id")
+  const data = eventData(event)
+  const id = getStringField(data, "id")
   if (id) {
     return id
   }
-  const request = getNestedRecord(event, "properties", "request")
+  const request = getNestedRecord(data, "request")
   return getStringField(request, "id")
 }
 
@@ -430,11 +433,14 @@ interface SessionLifecycleInfo {
 }
 
 function getSessionLifecycleInfo(event: unknown): SessionLifecycleInfo {
-  const info = getNestedRecord(event, "properties", "info")
+  const data = eventData(event)
+  const info = getNestedRecord(data, "info") ?? getNestedRecord(event, "properties", "info")
+  const pick = (key: string): string | null =>
+    getStringField(data, key) ?? getStringField(info, key)
   return {
-    id: getStringField(info, "id"),
-    title: getStringField(info, "title"),
-    parentID: getStringField(info, "parentID"),
+    id: pick("sessionID") ?? pick("id"),
+    title: pick("title"),
+    parentID: pick("parentID"),
   }
 }
 
@@ -444,10 +450,11 @@ interface MessageUpdatedInfo {
 }
 
 function getMessageUpdatedInfo(event: unknown): MessageUpdatedInfo {
-  const info = getNestedRecord(event, "properties", "info")
+  const data = eventData(event)
+  const info = getNestedRecord(data, "info") ?? getNestedRecord(event, "properties", "info")
   return {
-    role: getStringField(info, "role"),
-    sessionID: getStringField(info, "sessionID"),
+    role: getStringField(data, "role") ?? getStringField(info, "role"),
+    sessionID: getStringField(data, "sessionID") ?? getStringField(info, "sessionID"),
   }
 }
 
@@ -710,8 +717,10 @@ async function handleServerEvent(
     }
   }
 
-  if (event.type === "session.status" && event.properties.status.type === "busy") {
-    markSessionBusy(event.properties.sessionID)
+  const statusData = eventData(event)
+  if (event.type === "session.status" && getStringField(getNestedRecord(statusData, "status"), "type") === "busy") {
+    const busyID = getSessionIDFromEvent(event)
+    if (busyID) markSessionBusy(busyID)
   }
 
   // The v2 plugin stream does not deliver session.idle / session.status, so an
@@ -742,8 +751,7 @@ async function handleServerEvent(
   if (event.type === "session.execution.failed") {
     const sessionID = getExecutionSessionID(event)
     markSessionError(sessionID)
-    const props = getNestedRecord(event, "properties")
-    const errName = getStringField(getNestedRecord(props, "error"), "name")
+    const errName = getStringField(getNestedRecord(eventData(event), "error"), "name")
     const eventType: EventType = errName === "MessageAbortedError" ? "user_cancelled" : "error"
     let sessionTitle: string | null = null
     if (sessionID && config.showSessionTitle) {
@@ -756,7 +764,8 @@ async function handleServerEvent(
   if (event.type === "session.error") {
     const sessionID = getSessionIDFromEvent(event)
     markSessionError(sessionID)
-    const eventType: EventType = event.properties.error?.name === "MessageAbortedError" ? "user_cancelled" : "error"
+    const errName = getStringField(getNestedRecord(eventData(event), "error"), "name")
+    const eventType: EventType = errName === "MessageAbortedError" ? "user_cancelled" : "error"
     let sessionTitle: string | null = null
     if (sessionID && config.showSessionTitle) {
       const info = await api.getSession(sessionID)

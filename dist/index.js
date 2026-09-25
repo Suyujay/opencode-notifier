@@ -1826,14 +1826,10 @@ function claimFired(key, windowMs = DEDUPE_WINDOW_MS) {
   return true;
 }
 function getExecutionSessionID(event) {
-  const fromProps = getSessionIDFromEvent(event);
-  if (fromProps)
-    return fromProps;
-  const info = getNestedRecord(event, "properties", "info");
-  const fromInfo = getStringField(info, "id");
-  if (fromInfo)
-    return fromInfo;
-  return getStringField(asRecord(event), "sessionID");
+  const direct = getSessionIDFromEvent(event);
+  if (direct)
+    return direct;
+  return getStringField(getNestedRecord(eventData(event), "info"), "id");
 }
 function v1SessionClient(client) {
   return {
@@ -1932,6 +1928,9 @@ function getStringField(record, key) {
   }
   const value = record[key];
   return typeof value === "string" && value.length > 0 ? value : null;
+}
+function eventData(event) {
+  return getNestedRecord(event, "data") ?? getNestedRecord(event, "properties") ?? asRecord(event) ?? {};
 }
 var globalTurnCount = null;
 function loadTurnCount() {
@@ -2057,16 +2056,15 @@ async function handleEvent(config, eventType, projectName, elapsedSeconds, sessi
   await Promise.allSettled(promises);
 }
 function getSessionIDFromEvent(event) {
-  const properties = getNestedRecord(event, "properties");
-  return getStringField(properties, "sessionID");
+  return getStringField(eventData(event), "sessionID");
 }
 function getPermissionIDFromEvent(event) {
-  const properties = getNestedRecord(event, "properties");
-  const id = getStringField(properties, "id");
+  const data = eventData(event);
+  const id = getStringField(data, "id");
   if (id) {
     return id;
   }
-  const request = getNestedRecord(event, "properties", "request");
+  const request = getNestedRecord(data, "request");
   return getStringField(request, "id");
 }
 var PERMISSION_PENDING_GRACE_MS = 300;
@@ -2088,18 +2086,21 @@ async function isPermissionStillPending(client, permissionID) {
   }
 }
 function getSessionLifecycleInfo(event) {
-  const info = getNestedRecord(event, "properties", "info");
+  const data = eventData(event);
+  const info = getNestedRecord(data, "info") ?? getNestedRecord(event, "properties", "info");
+  const pick = (key) => getStringField(data, key) ?? getStringField(info, key);
   return {
-    id: getStringField(info, "id"),
-    title: getStringField(info, "title"),
-    parentID: getStringField(info, "parentID")
+    id: pick("sessionID") ?? pick("id"),
+    title: pick("title"),
+    parentID: pick("parentID")
   };
 }
 function getMessageUpdatedInfo(event) {
-  const info = getNestedRecord(event, "properties", "info");
+  const data = eventData(event);
+  const info = getNestedRecord(data, "info") ?? getNestedRecord(event, "properties", "info");
   return {
-    role: getStringField(info, "role"),
-    sessionID: getStringField(info, "sessionID")
+    role: getStringField(data, "role") ?? getStringField(info, "role"),
+    sessionID: getStringField(data, "sessionID") ?? getStringField(info, "sessionID")
   };
 }
 function clearPendingIdleTimer(sessionID) {
@@ -2271,8 +2272,11 @@ async function handleServerEvent(api, projectName, isCLI, event) {
       await handleEventWithElapsedTime(api, config, "complete", projectName, event);
     }
   }
-  if (event.type === "session.status" && event.properties.status.type === "busy") {
-    markSessionBusy(event.properties.sessionID);
+  const statusData = eventData(event);
+  if (event.type === "session.status" && getStringField(getNestedRecord(statusData, "status"), "type") === "busy") {
+    const busyID = getSessionIDFromEvent(event);
+    if (busyID)
+      markSessionBusy(busyID);
   }
   if (event.type === "session.execution.started") {
     const sid = getExecutionSessionID(event);
@@ -2296,8 +2300,7 @@ async function handleServerEvent(api, projectName, isCLI, event) {
   if (event.type === "session.execution.failed") {
     const sessionID = getExecutionSessionID(event);
     markSessionError(sessionID);
-    const props = getNestedRecord(event, "properties");
-    const errName = getStringField(getNestedRecord(props, "error"), "name");
+    const errName = getStringField(getNestedRecord(eventData(event), "error"), "name");
     const eventType = errName === "MessageAbortedError" ? "user_cancelled" : "error";
     let sessionTitle = null;
     if (sessionID && config.showSessionTitle) {
@@ -2309,7 +2312,8 @@ async function handleServerEvent(api, projectName, isCLI, event) {
   if (event.type === "session.error") {
     const sessionID = getSessionIDFromEvent(event);
     markSessionError(sessionID);
-    const eventType = event.properties.error?.name === "MessageAbortedError" ? "user_cancelled" : "error";
+    const errName = getStringField(getNestedRecord(eventData(event), "error"), "name");
+    const eventType = errName === "MessageAbortedError" ? "user_cancelled" : "error";
     let sessionTitle = null;
     if (sessionID && config.showSessionTitle) {
       const info = await api.getSession(sessionID);
