@@ -34,6 +34,104 @@ const sessionErrorSuppressionAt = new Map<string, number>()
 const sessionLastBusyAt = new Map<string, number>()
 const subagentSessionIds = new Set<string>()
 
+// Minimal session API surface the notifier needs. V1 wraps the legacy SDK
+// client; V2 wraps the plugin context. This keeps all event logic identical.
+export interface SessionClient {
+  listMessages(sessionID: string): Promise<Array<{ role?: string; created?: number }>>
+  getSession(sessionID: string): Promise<{ title: string | null; parentID: string | null }>
+  isPermissionPending(permissionID: string, sessionID: string | null): Promise<boolean>
+}
+
+function v1SessionClient(client: PluginInput["client"]): SessionClient {
+  return {
+    async listMessages(sessionID: string) {
+      const response = await client.session.messages({ path: { id: sessionID } })
+      const messages = (response as any)?.data ?? []
+      if (!Array.isArray(messages)) return []
+      return messages.map((msg: any) => {
+        const info = msg?.info ?? {}
+        const time = info?.time ?? {}
+        return {
+          role: typeof info.role === "string" ? info.role : undefined,
+          created: typeof time.created === "number" ? time.created : undefined,
+        }
+      })
+    },
+    async getSession(sessionID: string) {
+      try {
+        const response = await client.session.get({ path: { id: sessionID } })
+        const data = (response as any)?.data ?? {}
+        return {
+          title: typeof data.title === "string" ? data.title : null,
+          parentID: typeof data.parentID === "string" ? data.parentID : null,
+        }
+      } catch {
+        return { title: null, parentID: null }
+      }
+    },
+    async isPermissionPending(permissionID: string) {
+      return isPermissionStillPending(client, permissionID)
+    },
+  }
+}
+
+function v2SessionClient(ctx: any): SessionClient {
+  return {
+    async listMessages(sessionID: string) {
+      try {
+        const messages = await ctx.session.context({ sessionID })
+        const list = Array.isArray(messages) ? messages : []
+        return list.map((msg: any) => {
+          const info = msg?.info ?? msg ?? {}
+          const time = info?.time ?? {}
+          const created =
+            typeof time.created === "number"
+              ? time.created
+              : typeof time.start === "number"
+                ? time.start
+                : undefined
+          return {
+            role: typeof info.role === "string" ? info.role : undefined,
+            created,
+          }
+        })
+      } catch {
+        return []
+      }
+    },
+    async getSession(sessionID: string) {
+      try {
+        const res = await ctx.session.get({ sessionID })
+        const data = (res as any)?.data ?? res ?? {}
+        return {
+          title: typeof data.title === "string" ? data.title : null,
+          parentID: typeof data.parentID === "string" ? data.parentID : null,
+        }
+      } catch {
+        return { title: null, parentID: null }
+      }
+    },
+    async isPermissionPending(permissionID: string, sessionID: string | null) {
+      try {
+        const pending = sessionID
+          ? await ctx.permission.list({ sessionID })
+          : await ctx.permission.list()
+        const list = Array.isArray(pending)
+          ? pending
+          : Array.isArray((pending as any)?.data)
+            ? (pending as any).data
+            : Array.isArray((pending as any)?.requests)
+              ? (pending as any).requests
+              : null
+        if (!list) return true
+        return list.some((p: any) => p?.id === permissionID || p?.requestID === permissionID)
+      } catch {
+        return true
+      }
+    },
+  }
+}
+
 type UnknownRecord = Record<string, unknown>
 
 function asRecord(value: unknown): UnknownRecord | null {
@@ -361,20 +459,18 @@ function shouldSuppressSessionIdle(sessionID: string, consume: boolean = true): 
 }
 
 async function getElapsedSinceLastPrompt(
-  client: PluginInput["client"],
+  api: SessionClient,
   sessionID: string,
   nowMs: number = Date.now()
 ): Promise<number | null> {
   try {
-    const response = await client.session.messages({ path: { id: sessionID } })
-    const messages = response.data ?? []
+    const messages = await api.listMessages(sessionID)
 
     let lastUserMessageTime: number | null = null
     for (const msg of messages) {
-      const info = msg.info
-      if (info.role === "user" && typeof info.time?.created === "number") {
-        if (lastUserMessageTime === null || info.time.created > lastUserMessageTime) {
-          lastUserMessageTime = info.time.created
+      if (msg.role === "user" && typeof msg.created === "number") {
+        if (lastUserMessageTime === null || msg.created > lastUserMessageTime) {
+          lastUserMessageTime = msg.created
         }
       }
     }
@@ -388,29 +484,8 @@ async function getElapsedSinceLastPrompt(
   return null
 }
 
-interface SessionInfo {
-  isChild: boolean
-  title: string | null
-}
-
-async function getSessionInfo(
-  client: PluginInput["client"],
-  sessionID: string
-): Promise<SessionInfo> {
-  try {
-    const response = await client.session.get({ path: { id: sessionID } })
-    const title = typeof response.data?.title === "string" ? response.data.title : null
-    return {
-      isChild: !!response.data?.parentID,
-      title,
-    }
-  } catch {
-    return { isChild: false, title: null }
-  }
-}
-
 async function processSessionIdle(
-  client: PluginInput["client"],
+  api: SessionClient,
   config: NotifierConfig,
   projectName: string | null,
   event: unknown,
@@ -429,11 +504,11 @@ async function processSessionIdle(
   // Fast path: if we already know this is a subagent from in-memory tracking,
   // skip the API call and go straight to subagent_complete
   if (subagentSessionIds.has(sessionID)) {
-    await handleEventWithElapsedTime(client, config, "subagent_complete", projectName, event, idleReceivedAtMs, null)
+    await handleEventWithElapsedTime(api, config, "subagent_complete", projectName, event, idleReceivedAtMs, null)
     return
   }
 
-  const sessionInfo = await getSessionInfo(client, sessionID)
+  const sess = await api.getSession(sessionID)
 
   if (!hasCurrentSessionIdleSequence(sessionID, sequence)) {
     return
@@ -443,18 +518,18 @@ async function processSessionIdle(
     return
   }
 
-  if (!sessionInfo.isChild) {
-    await handleEventWithElapsedTime(client, config, "complete", projectName, event, idleReceivedAtMs, sessionInfo.title)
+  if (!sess.parentID) {
+    await handleEventWithElapsedTime(api, config, "complete", projectName, event, idleReceivedAtMs, sess.title)
     return
   }
 
   // Update in-memory set now that we confirmed it's a child via API
   subagentSessionIds.add(sessionID)
-  await handleEventWithElapsedTime(client, config, "subagent_complete", projectName, event, idleReceivedAtMs, sessionInfo.title)
+  await handleEventWithElapsedTime(api, config, "subagent_complete", projectName, event, idleReceivedAtMs, sess.title)
 }
 
 function scheduleSessionIdle(
-  client: PluginInput["client"],
+  api: SessionClient,
   config: NotifierConfig,
   projectName: string | null,
   event: unknown,
@@ -466,14 +541,14 @@ function scheduleSessionIdle(
 
   const timer = setTimeout(() => {
     pendingIdleTimers.delete(sessionID)
-    void processSessionIdle(client, config, projectName, event, sessionID, sequence, idleReceivedAtMs).catch(() => undefined)
+    void processSessionIdle(api, config, projectName, event, sessionID, sequence, idleReceivedAtMs).catch(() => undefined)
   }, IDLE_COMPLETE_DELAY_MS)
 
   pendingIdleTimers.set(sessionID, timer)
 }
 
 async function handleEventWithElapsedTime(
-  client: PluginInput["client"],
+  api: SessionClient,
   config: NotifierConfig,
   eventType: EventType,
   projectName: string | null,
@@ -501,20 +576,117 @@ async function handleEventWithElapsedTime(
   let elapsedSeconds: number | null = null
   if (shouldLookupElapsed) {
     if (sessionID) {
-      elapsedSeconds = await getElapsedSinceLastPrompt(client, sessionID, elapsedReferenceNowMs)
+      elapsedSeconds = await getElapsedSinceLastPrompt(api, sessionID, elapsedReferenceNowMs)
     }
   }
 
   let sessionTitle: string | null = preloadedSessionTitle ?? null
   const shouldLookupSessionInfo = sessionID && !sessionTitle && (config.showSessionTitle || shouldResolveAgentNameForEvent(config, eventType))
   if (shouldLookupSessionInfo) {
-    const info = await getSessionInfo(client, sessionID)
+    const info = await api.getSession(sessionID)
     sessionTitle = info.title
   }
 
   const agentName = extractAgentNameFromSessionTitle(sessionTitle)
 
   await handleEvent(config, eventType, projectName, elapsedSeconds, sessionTitle, sessionID, agentName)
+}
+
+async function handleServerEvent(
+  api: SessionClient,
+  projectName: string | null,
+  isCLI: boolean,
+  event: any
+): Promise<void> {
+  const config = loadConfig()
+
+  // Track subagent sessions from session lifecycle events
+  if (event.type === "session.created") {
+    const info = getSessionLifecycleInfo(event)
+    if (info.parentID && info.id) {
+      subagentSessionIds.add(info.id)
+    } else {
+      // Non-subagent session started
+      await handleEvent(config, "session_started", projectName, null, info.title, info.id, null)
+    }
+  }
+
+  if (event.type === "session.updated") {
+    const info = getSessionLifecycleInfo(event)
+    if (info.parentID && info.id) {
+      subagentSessionIds.add(info.id)
+    }
+  }
+
+  if (event.type === "session.deleted") {
+    const info = getSessionLifecycleInfo(event)
+    if (info.id) {
+      subagentSessionIds.delete(info.id)
+    }
+  }
+
+  if ((event as any).type === "permission.asked") {
+    const sessionID = getSessionIDFromEvent(event)
+    const permissionID = getPermissionIDFromEvent(event)
+    let stillPending = true
+    if (permissionID) {
+      // Auto-approved requests are resolved immediately, so wait briefly
+      // and only notify when the request is still pending.
+      await new Promise((resolve) => setTimeout(resolve, PERMISSION_PENDING_GRACE_MS))
+      stillPending = await api.isPermissionPending(permissionID, sessionID)
+    }
+    // Claim the shared dedupe window only when a notification is actually
+    // about to fire: a silently skipped auto-approved request must not mute a
+    // real one arriving within the same second.
+    if (stillPending && !shouldSuppressPermissionAlert(sessionID)) {
+      await handleEventWithElapsedTime(api, config, "permission", projectName, event)
+    }
+  }
+
+  if (event.type === "session.idle") {
+    const sessionID = getSessionIDFromEvent(event)
+    if (sessionID) {
+      if (isCLI) {
+        // CLI sessions (opencode run) exit soon after going idle.
+        // Process completion directly to avoid losing the notification
+        // when the process terminates before the debounce timer fires.
+        const idleReceivedAtMs = Date.now()
+        const sequence = bumpSessionIdleSequence(sessionID)
+        await processSessionIdle(api, config, projectName, event, sessionID, sequence, idleReceivedAtMs)
+      } else {
+        scheduleSessionIdle(api, config, projectName, event, sessionID)
+      }
+    } else {
+      await handleEventWithElapsedTime(api, config, "complete", projectName, event)
+    }
+  }
+
+  if (event.type === "session.status" && event.properties.status.type === "busy") {
+    markSessionBusy(event.properties.sessionID)
+  }
+
+  if (event.type === "session.error") {
+    const sessionID = getSessionIDFromEvent(event)
+    markSessionError(sessionID)
+    const eventType: EventType = event.properties.error?.name === "MessageAbortedError" ? "user_cancelled" : "error"
+    let sessionTitle: string | null = null
+    if (sessionID && config.showSessionTitle) {
+      const info = await api.getSession(sessionID)
+      sessionTitle = info.title
+    }
+    await handleEventWithElapsedTime(api, config, eventType, projectName, event, undefined, sessionTitle)
+  }
+
+  if (event.type === "message.updated") {
+    const info = getMessageUpdatedInfo(event)
+    if (info.role === "user") {
+      const sessionID = info.sessionID
+      // Only fire for non-subagent sessions
+      if (!sessionID || !subagentSessionIds.has(sessionID)) {
+        await handleEvent(config, "user_message", projectName, null, null, sessionID, null)
+      }
+    }
+  }
 }
 
 export const NotifierPlugin: Plugin = async ({ client, directory }) => {
@@ -543,97 +715,11 @@ export const NotifierPlugin: Plugin = async ({ client, directory }) => {
     }, 100)
   }
 
+  const api = v1SessionClient(client)
+
   return {
     event: async ({ event }) => {
-      const config = getConfig()
-
-      // Track subagent sessions from session lifecycle events
-      if (event.type === "session.created") {
-        const info = getSessionLifecycleInfo(event)
-        if (info.parentID && info.id) {
-          subagentSessionIds.add(info.id)
-        } else {
-          // Non-subagent session started
-          await handleEvent(config, "session_started", projectName, null, info.title, info.id, null)
-        }
-      }
-
-      if (event.type === "session.updated") {
-        const info = getSessionLifecycleInfo(event)
-        if (info.parentID && info.id) {
-          subagentSessionIds.add(info.id)
-        }
-      }
-
-      if (event.type === "session.deleted") {
-        const info = getSessionLifecycleInfo(event)
-        if (info.id) {
-          subagentSessionIds.delete(info.id)
-        }
-      }
-
-      if ((event as any).type === "permission.asked") {
-        const sessionID = getSessionIDFromEvent(event)
-        const permissionID = getPermissionIDFromEvent(event)
-        let stillPending = true
-        if (permissionID) {
-          // Auto-approved requests are resolved immediately, so wait briefly
-          // and only notify when the request is still pending.
-          await new Promise((resolve) => setTimeout(resolve, PERMISSION_PENDING_GRACE_MS))
-          stillPending = await isPermissionStillPending(client, permissionID)
-        }
-        // Claim the shared dedupe window only when a notification is actually
-        // about to fire: a silently skipped auto-approved request must not mute a
-        // real one arriving within the same second.
-        if (stillPending && !shouldSuppressPermissionAlert(sessionID)) {
-          await handleEventWithElapsedTime(client, config, "permission", projectName, event)
-        }
-      }
-
-      if (event.type === "session.idle") {
-        const sessionID = getSessionIDFromEvent(event)
-        if (sessionID) {
-          if (isCLI) {
-            // CLI sessions (opencode run) exit soon after going idle.
-            // Process completion directly to avoid losing the notification
-            // when the process terminates before the debounce timer fires.
-            const idleReceivedAtMs = Date.now()
-            const sequence = bumpSessionIdleSequence(sessionID)
-            await processSessionIdle(client, config, projectName, event, sessionID, sequence, idleReceivedAtMs)
-          } else {
-            scheduleSessionIdle(client, config, projectName, event, sessionID)
-          }
-        } else {
-          await handleEventWithElapsedTime(client, config, "complete", projectName, event)
-        }
-      }
-
-      if (event.type === "session.status" && event.properties.status.type === "busy") {
-        markSessionBusy(event.properties.sessionID)
-      }
-
-      if (event.type === "session.error") {
-        const sessionID = getSessionIDFromEvent(event)
-        markSessionError(sessionID)
-        const eventType: EventType = event.properties.error?.name === "MessageAbortedError" ? "user_cancelled" : "error"
-        let sessionTitle: string | null = null
-        if (sessionID && config.showSessionTitle) {
-          const info = await getSessionInfo(client, sessionID)
-          sessionTitle = info.title
-        }
-        await handleEventWithElapsedTime(client, config, eventType, projectName, event, undefined, sessionTitle)
-      }
-
-      if (event.type === "message.updated") {
-        const info = getMessageUpdatedInfo(event)
-        if (info.role === "user") {
-          const sessionID = info.sessionID
-          // Only fire for non-subagent sessions
-          if (!sessionID || !subagentSessionIds.has(sessionID)) {
-            await handleEvent(config, "user_message", projectName, null, null, sessionID, null)
-          }
-        }
-      }
+      await handleServerEvent(api, projectName, isCLI, event)
     },
     "permission.ask": async () => {
       const config = getConfig()
@@ -653,9 +739,78 @@ export const NotifierPlugin: Plugin = async ({ client, directory }) => {
   }
 }
 
-const pluginModule: PluginModule = {
+// OpenCode v2 entrypoint. Same behavior as the v1 plugin above, driven by the
+// v2 plugin context instead of the legacy SDK client. A plain object is enough:
+// the v2 loader accepts any default export with an id and a setup function,
+// so no @opencode/plugin dependency is needed.
+let v2SetupDone = false
+
+async function setupV2(ctx: any): Promise<() => void> {
+  if (v2SetupDone) return () => {}
+  v2SetupDone = true
+
+  captureStartupWindowId()
+
+  const clientEnv = process.env.OPENCODE_CLIENT
+  if (clientEnv && clientEnv !== "cli") {
+    if (!loadConfig().enableOnDesktop) return () => {}
+  }
+
+  const directory =
+    typeof ctx?.location?.directory === "string" && ctx.location.directory.length > 0
+      ? ctx.location.directory
+      : null
+  const projectName = directory ? (loadConfig().showFullPath ? directory : basename(directory)) : null
+
+  const api = v2SessionClient(ctx)
+  const isCLI = isCLIClient(clientEnv)
+  if (isCLI) {
+    void handleEvent(loadConfig(), "client_connected", projectName, null)
+  } else {
+    setTimeout(() => {
+      void handleEvent(loadConfig(), "client_connected", projectName, null)
+    }, 100)
+  }
+
+  // question / plan_exit detection. The v2 permission.asked event already covers
+  // the v1 "permission.ask" hook, so only the tool hook is ported.
+  try {
+    await ctx.tool.hook("execute.before", (hookEvent: any) => {
+      const config = loadConfig()
+      const tool = hookEvent?.tool
+      if (tool === "question") {
+        void handleEvent(config, "question", projectName, null)
+      }
+      if (tool === "plan_exit") {
+        void handleEvent(config, "plan_exit", projectName, null)
+      }
+    })
+  } catch {
+    // Hook domain unavailable; the event stream still covers idle/error/permission.
+  }
+
+  const controller = new AbortController()
+  void (async () => {
+    try {
+      for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+        try {
+          await handleServerEvent(api, projectName, isCLI, event)
+        } catch {
+          // Never break the event stream on a single bad event.
+        }
+      }
+    } catch {
+      // Aborted on unload.
+    }
+  })()
+
+  return () => controller.abort()
+}
+
+const pluginModule = {
   id: "opencode-notifier",
+  setup: setupV2,
   server: NotifierPlugin,
 }
 
-export default pluginModule
+export default pluginModule as unknown as PluginModule
