@@ -1,5 +1,6 @@
 import type { Plugin, PluginInput, PluginModule } from "@opencode-ai/plugin"
-import { basename } from "path"
+import { basename, join } from "path"
+import { tmpdir } from "os"
 import { readFileSync, writeFileSync } from "fs"
 import {
   loadConfig,
@@ -33,6 +34,51 @@ const sessionIdleSequence = new Map<string, number>()
 const sessionErrorSuppressionAt = new Map<string, number>()
 const sessionLastBusyAt = new Map<string, number>()
 const subagentSessionIds = new Set<string>()
+
+// Cross-instance single-flight: every location runs its own plugin instance
+// but all instances see the same global event stream, so without this every
+// notification would fire once per location.
+const DEDUPE_WINDOW_MS = 5000
+
+function dedupePath(): string {
+  return join(tmpdir(), "opencode-notifier-fired.json")
+}
+
+function claimFired(key: string, windowMs: number = DEDUPE_WINDOW_MS): boolean {
+  const now = Date.now()
+  let table: Record<string, number> = {}
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(dedupePath(), "utf-8"))
+    if (parsed !== null && typeof parsed === "object") {
+      table = parsed as Record<string, number>
+    }
+  } catch {
+    table = {}
+  }
+  const last = table[key]
+  if (typeof last === "number" && now - last < windowMs) {
+    return false
+  }
+  table[key] = now
+  for (const [k, ts] of Object.entries(table)) {
+    if (typeof ts !== "number" || now - ts > 60000) delete table[k]
+  }
+  try {
+    writeFileSync(dedupePath(), JSON.stringify(table))
+  } catch {}
+  return true
+}
+
+// session.execution.* events carry the session id in properties (same shape as
+// the other session events); fall back to info.id / top-level just in case.
+function getExecutionSessionID(event: unknown): string | null {
+  const fromProps = getSessionIDFromEvent(event)
+  if (fromProps) return fromProps
+  const info = getNestedRecord(event, "properties", "info")
+  const fromInfo = getStringField(info, "id")
+  if (fromInfo) return fromInfo
+  return getStringField(asRecord(event), "sessionID")
+}
 
 // Minimal session API surface the notifier needs. V1 wraps the legacy SDK
 // client; V2 wraps the plugin context. This keeps all event logic identical.
@@ -267,6 +313,9 @@ async function handleEvent(
   sessionID?: string | null,
   agentName?: string | null
 ): Promise<void> {
+  if (!claimFired(`${eventType}:${sessionID ?? "global"}`, sessionID ? 5000 : 2500)) {
+    return
+  }
   if (config.suppressWhenFocused && isTerminalFocused()) {
     return
   }
@@ -665,6 +714,45 @@ async function handleServerEvent(
     markSessionBusy(event.properties.sessionID)
   }
 
+  // The v2 plugin stream does not deliver session.idle / session.status, so an
+  // execution turn finishing is the equivalent completion signal (same shape of
+  // handling, including the debounce and the subagent check).
+  if (event.type === "session.execution.started") {
+    const sid = getExecutionSessionID(event)
+    if (sid) markSessionBusy(sid)
+  }
+
+  if (event.type === "session.execution.succeeded") {
+    // v2 plugin stream does not deliver session.idle / session.status, so an
+    // execution turn finishing is the equivalent completion signal.
+    const sessionID = getExecutionSessionID(event)
+    if (sessionID) {
+      if (isCLI) {
+        const idleReceivedAtMs = Date.now()
+        const sequence = bumpSessionIdleSequence(sessionID)
+        await processSessionIdle(api, config, projectName, event, sessionID, sequence, idleReceivedAtMs)
+      } else {
+        scheduleSessionIdle(api, config, projectName, event, sessionID)
+      }
+    } else {
+      await handleEventWithElapsedTime(api, config, "complete", projectName, event)
+    }
+  }
+
+  if (event.type === "session.execution.failed") {
+    const sessionID = getExecutionSessionID(event)
+    markSessionError(sessionID)
+    const props = getNestedRecord(event, "properties")
+    const errName = getStringField(getNestedRecord(props, "error"), "name")
+    const eventType: EventType = errName === "MessageAbortedError" ? "user_cancelled" : "error"
+    let sessionTitle: string | null = null
+    if (sessionID && config.showSessionTitle) {
+      const info = await api.getSession(sessionID)
+      sessionTitle = info.title
+    }
+    await handleEventWithElapsedTime(api, config, eventType, projectName, event, undefined, sessionTitle)
+  }
+
   if (event.type === "session.error") {
     const sessionID = getSessionIDFromEvent(event)
     markSessionError(sessionID)
@@ -746,20 +834,22 @@ export const NotifierPlugin: Plugin = async ({ client, directory }) => {
 let v2SetupDone = false
 
 async function setupV2(ctx: any): Promise<() => void> {
-  if (v2SetupDone) return () => {}
+  const location = typeof ctx?.location?.directory === "string" ? ctx.location.directory : null
+  const clientEnv = process.env.OPENCODE_CLIENT ?? undefined
+  if (v2SetupDone) {
+    return () => {}
+  }
   v2SetupDone = true
 
   captureStartupWindowId()
 
-  const clientEnv = process.env.OPENCODE_CLIENT
   if (clientEnv && clientEnv !== "cli") {
-    if (!loadConfig().enableOnDesktop) return () => {}
+    if (!loadConfig().enableOnDesktop) {
+      return () => {}
+    }
   }
 
-  const directory =
-    typeof ctx?.location?.directory === "string" && ctx.location.directory.length > 0
-      ? ctx.location.directory
-      : null
+  const directory = location && location.length > 0 ? location : null
   const projectName = directory ? (loadConfig().showFullPath ? directory : basename(directory)) : null
 
   const api = v2SessionClient(ctx)

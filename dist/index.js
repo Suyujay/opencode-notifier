@@ -1,5 +1,6 @@
 // src/index.ts
-import { basename } from "path";
+import { basename, join as join4 } from "path";
+import { tmpdir as tmpdir2 } from "os";
 import { readFileSync as readFileSync3, writeFileSync as writeFileSync2 } from "fs";
 
 // src/config.ts
@@ -1795,6 +1796,45 @@ var sessionIdleSequence = new Map;
 var sessionErrorSuppressionAt = new Map;
 var sessionLastBusyAt = new Map;
 var subagentSessionIds = new Set;
+var DEDUPE_WINDOW_MS = 5000;
+function dedupePath() {
+  return join4(tmpdir2(), "opencode-notifier-fired.json");
+}
+function claimFired(key, windowMs = DEDUPE_WINDOW_MS) {
+  const now = Date.now();
+  let table = {};
+  try {
+    const parsed = JSON.parse(readFileSync3(dedupePath(), "utf-8"));
+    if (parsed !== null && typeof parsed === "object") {
+      table = parsed;
+    }
+  } catch {
+    table = {};
+  }
+  const last = table[key];
+  if (typeof last === "number" && now - last < windowMs) {
+    return false;
+  }
+  table[key] = now;
+  for (const [k, ts] of Object.entries(table)) {
+    if (typeof ts !== "number" || now - ts > 60000)
+      delete table[k];
+  }
+  try {
+    writeFileSync2(dedupePath(), JSON.stringify(table));
+  } catch {}
+  return true;
+}
+function getExecutionSessionID(event) {
+  const fromProps = getSessionIDFromEvent(event);
+  if (fromProps)
+    return fromProps;
+  const info = getNestedRecord(event, "properties", "info");
+  const fromInfo = getStringField(info, "id");
+  if (fromInfo)
+    return fromInfo;
+  return getStringField(asRecord(event), "sessionID");
+}
 function v1SessionClient(client) {
   return {
     async listMessages(sessionID) {
@@ -1971,6 +2011,9 @@ function shouldResolveAgentNameForEvent(config, eventType) {
   return (config.command.args ?? []).some((arg) => arg.includes("{agentName}"));
 }
 async function handleEvent(config, eventType, projectName, elapsedSeconds, sessionTitle, sessionID, agentName) {
+  if (!claimFired(`${eventType}:${sessionID ?? "global"}`, sessionID ? 5000 : 2500)) {
+    return;
+  }
   if (config.suppressWhenFocused && isTerminalFocused()) {
     return;
   }
@@ -2231,6 +2274,38 @@ async function handleServerEvent(api, projectName, isCLI, event) {
   if (event.type === "session.status" && event.properties.status.type === "busy") {
     markSessionBusy(event.properties.sessionID);
   }
+  if (event.type === "session.execution.started") {
+    const sid = getExecutionSessionID(event);
+    if (sid)
+      markSessionBusy(sid);
+  }
+  if (event.type === "session.execution.succeeded") {
+    const sessionID = getExecutionSessionID(event);
+    if (sessionID) {
+      if (isCLI) {
+        const idleReceivedAtMs = Date.now();
+        const sequence = bumpSessionIdleSequence(sessionID);
+        await processSessionIdle(api, config, projectName, event, sessionID, sequence, idleReceivedAtMs);
+      } else {
+        scheduleSessionIdle(api, config, projectName, event, sessionID);
+      }
+    } else {
+      await handleEventWithElapsedTime(api, config, "complete", projectName, event);
+    }
+  }
+  if (event.type === "session.execution.failed") {
+    const sessionID = getExecutionSessionID(event);
+    markSessionError(sessionID);
+    const props = getNestedRecord(event, "properties");
+    const errName = getStringField(getNestedRecord(props, "error"), "name");
+    const eventType = errName === "MessageAbortedError" ? "user_cancelled" : "error";
+    let sessionTitle = null;
+    if (sessionID && config.showSessionTitle) {
+      const info = await api.getSession(sessionID);
+      sessionTitle = info.title;
+    }
+    await handleEventWithElapsedTime(api, config, eventType, projectName, event, undefined, sessionTitle);
+  }
   if (event.type === "session.error") {
     const sessionID = getSessionIDFromEvent(event);
     markSessionError(sessionID);
@@ -2294,16 +2369,19 @@ var NotifierPlugin = async ({ client, directory }) => {
 };
 var v2SetupDone = false;
 async function setupV2(ctx) {
-  if (v2SetupDone)
+  const location = typeof ctx?.location?.directory === "string" ? ctx.location.directory : null;
+  const clientEnv = process.env.OPENCODE_CLIENT ?? undefined;
+  if (v2SetupDone) {
     return () => {};
+  }
   v2SetupDone = true;
   captureStartupWindowId();
-  const clientEnv = process.env.OPENCODE_CLIENT;
   if (clientEnv && clientEnv !== "cli") {
-    if (!loadConfig().enableOnDesktop)
+    if (!loadConfig().enableOnDesktop) {
       return () => {};
+    }
   }
-  const directory = typeof ctx?.location?.directory === "string" && ctx.location.directory.length > 0 ? ctx.location.directory : null;
+  const directory = location && location.length > 0 ? location : null;
   const projectName = directory ? loadConfig().showFullPath ? directory : basename(directory) : null;
   const api = v2SessionClient(ctx);
   const isCLI = isCLIClient(clientEnv);
