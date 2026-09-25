@@ -1,6 +1,7 @@
 import type { Plugin, PluginInput, PluginModule } from "@opencode-ai/plugin"
 import type { Context as OpenCodeContext, Plugin as OpenCodePlugin } from "@opencode/plugin/promise/plugin"
-import { basename } from "path"
+import { basename, join } from "path"
+import { tmpdir } from "os"
 import { readFileSync, writeFileSync } from "fs"
 import {
   loadConfig,
@@ -364,6 +365,8 @@ function shouldSuppressSessionIdle(sessionID: string, consume: boolean = true): 
 interface SessionInfo {
   isChild: boolean
   title: string | null
+  /** Directory the session runs in, when the client exposes one. */
+  directory: string | null
 }
 
 /**
@@ -403,7 +406,7 @@ async function getSessionInfo(
   try {
     return await client.sessionInfo(sessionID)
   } catch {
-    return { isChild: false, title: null }
+    return { isChild: false, title: null, directory: null }
   }
 }
 
@@ -517,7 +520,14 @@ async function handleEventWithElapsedTime(
  * The V1 and V2 adapters translate their own event envelopes into these.
  */
 export type NotifierEvent =
-  | { type: "session.created"; sessionID: string | null; parentID: string | null; title: string | null }
+  | {
+      type: "session.created"
+      sessionID: string | null
+      parentID: string | null
+      title: string | null
+      /** v2 carries the session's own directory; v1 has none. */
+      directory?: string | null
+    }
   | { type: "session.updated"; sessionID: string | null; parentID: string | null }
   | { type: "session.deleted"; sessionID: string | null }
   | { type: "permission.asked"; sessionID: string | null; permissionID: string | null }
@@ -530,6 +540,54 @@ export type NotifierEvent =
 
 interface NotifierRuntime {
   dispatch(event: NotifierEvent): Promise<void>
+}
+
+// v2 runs one plugin instance per location, but every instance receives the
+// whole server event stream. Two consequences the upstream code does not cover:
+//   1. the same notification would fire once per instance;
+//   2. the notification title would show whichever instance won the race, not
+//      the directory the session actually ran in.
+// Both are handled with a session -> directory map, a lazy per-session lookup,
+// and a cross-instance single-flight keyed on the event itself.
+const SESSION_LOCATIONS = new Map<string, string>()
+const DEDUPE_WINDOW_MS = 5000
+
+function dedupePath(): string {
+  return join(tmpdir(), "opencode-notifier-fired.json")
+}
+
+function claimFired(key: string, windowMs: number = DEDUPE_WINDOW_MS): boolean {
+  const now = Date.now()
+  let table: Record<string, number> = {}
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(dedupePath(), "utf-8"))
+    if (parsed !== null && typeof parsed === "object") table = parsed as Record<string, number>
+  } catch {
+    table = {}
+  }
+  const last = table[key]
+  if (typeof last === "number" && now - last < windowMs) return false
+  table[key] = now
+  for (const [k, ts] of Object.entries(table)) {
+    if (typeof ts !== "number" || now - ts > 60000) delete table[k]
+  }
+  try {
+    writeFileSync(dedupePath(), JSON.stringify(table))
+  } catch {
+    // Losing the race must never break notifications.
+  }
+  return true
+}
+
+function projectNameFor(directory: string | null): string | null {
+  if (!directory) return null
+  return loadConfig().showFullPath ? directory : basename(directory)
+}
+
+/** A notification is about one turn; key it on what actually happened. */
+function dedupeKey(event: NotifierEvent): string {
+  const sessionID = "sessionID" in event ? (event.sessionID ?? "global") : "global"
+  return `${event.type}:${sessionID}`
 }
 
 /**
@@ -549,8 +607,31 @@ function createNotifierRuntime(
   }
 
   const getConfig = () => loadConfig()
-  const projectName = directory ? (getConfig().showFullPath ? directory : basename(directory)) : null
   const isCLI = isCLIClient(clientEnv)
+
+  // This instance's own directory is only the fallback. Prefer the directory
+  // the session ran in so the title is right on every instance.
+  const instanceProjectName = projectNameFor(directory)
+
+  const rememberLocation = (sessionID: string | null, locationDirectory: string | null): void => {
+    if (sessionID && locationDirectory) SESSION_LOCATIONS.set(sessionID, locationDirectory)
+  }
+
+  const resolveProjectName = async (sessionID: string | null): Promise<string | null> => {
+    if (!sessionID) return instanceProjectName
+    const known = SESSION_LOCATIONS.get(sessionID)
+    if (known) return projectNameFor(known)
+    try {
+      const info = await client.sessionInfo(sessionID)
+      if (info.directory) {
+        SESSION_LOCATIONS.set(sessionID, info.directory)
+        return projectNameFor(info.directory)
+      }
+    } catch {
+      // Fall through to this instance's directory.
+    }
+    return instanceProjectName
+  }
 
   // Fire client_connected after the plugin is fully initialized.
   // There is no SDK event that reliably signals client connection from a plugin's
@@ -558,15 +639,25 @@ function createNotifierRuntime(
   // Config is read at fire-time so that any user overrides are respected.
   // CLI sessions skip the delay since the process may exit before it fires.
   if (isCLI) {
-    void handleEvent(getConfig(), "client_connected", projectName, null)
+    void handleEvent(getConfig(), "client_connected", instanceProjectName, null)
   } else {
     setTimeout(() => {
-      void handleEvent(getConfig(), "client_connected", projectName, null)
+      void handleEvent(getConfig(), "client_connected", instanceProjectName, null)
     }, 100)
   }
 
   const dispatch = async (event: NotifierEvent): Promise<void> => {
     const config = getConfig()
+
+    // One notification per turn across all plugin instances.
+    if (!claimFired(dedupeKey(event))) return
+
+    if (event.type === "session.created") {
+      rememberLocation(event.sessionID, event.directory ?? null)
+    }
+
+    const sessionID = "sessionID" in event ? event.sessionID : null
+    const projectName = await resolveProjectName(sessionID ?? null)
 
     switch (event.type) {
       case "session.created": {
@@ -753,6 +844,9 @@ export function normalizeV2Event(event: unknown): NotifierEvent[] {
       sessionID: getStringField(data, "sessionID"),
       parentID: getStringField(data, "parentID"),
       title: getStringField(data, "title"),
+      // Lets the runtime title notifications with the session's own project
+      // rather than the location of whichever plugin instance won the race.
+      directory: getStringField(getNestedRecord(data, "location"), "directory"),
     })
   }
 
@@ -833,6 +927,7 @@ function createV1SessionClient(client: PluginInput["client"]): NotifierSessionCl
       return {
         isChild: !!response.data?.parentID,
         title: typeof response.data?.title === "string" ? response.data.title : null,
+        directory: null,
       }
     },
     permissionPending(_sessionID: string | null, permissionID: string): Promise<boolean> {
@@ -863,6 +958,7 @@ function createV2SessionClient(ctx: OpenCodeContext): NotifierSessionClient {
       return {
         isChild: !!info?.parentID,
         title: typeof info?.title === "string" ? info.title : null,
+        directory: typeof info?.location?.directory === "string" ? info.location.directory : null,
       }
     },
     async permissionPending(sessionID: string | null, permissionID: string): Promise<boolean> {

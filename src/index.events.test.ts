@@ -110,7 +110,7 @@ describe("normalizeV2Event", () => {
     })
 
     expect(events).toEqual([
-      { type: "session.created", sessionID: "child-1", parentID: "parent-1", title: "Subagent" },
+      { type: "session.created", sessionID: "child-1", parentID: "parent-1", title: "Subagent", directory: null },
     ])
   })
 
@@ -121,7 +121,28 @@ describe("normalizeV2Event", () => {
     })
 
     expect(events).toEqual([
-      { type: "session.created", sessionID: "s-1", parentID: null, title: "Work" },
+      { type: "session.created", sessionID: "s-1", parentID: null, title: "Work", directory: null },
+    ])
+  })
+
+  test("carries the session location so titles use the session's own project", () => {
+    const events = normalizeV2Event({
+      type: "session.created",
+      data: {
+        sessionID: "s-1",
+        title: "Work",
+        location: { directory: "D:\\Obsidian\\Synopsys" },
+      },
+    })
+
+    expect(events).toEqual([
+      {
+        type: "session.created",
+        sessionID: "s-1",
+        parentID: null,
+        title: "Work",
+        directory: "D:\\Obsidian\\Synopsys",
+      },
     ])
   })
 
